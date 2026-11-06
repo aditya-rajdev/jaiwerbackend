@@ -1,6 +1,6 @@
 import os
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from postgrest.exceptions import APIError
@@ -50,13 +50,17 @@ def test_untrusted_peer_spoofed_forwarded_for_header_ignored():
 
 
 def test_trusted_peer_forwarded_for_parsed_correctly():
-    mock_request = MagicMock()
-    # Trusted internal proxy IP: 10.0.0.1
-    mock_request.client.host = "10.0.0.1"
-    # Forwarded header containing client IP 198.51.100.25
-    mock_request.headers.get.side_effect = lambda h: "198.51.100.25, 10.0.0.1" if h == "x-forwarded-for" else None
+    mock_settings = MagicMock()
+    mock_settings.trusted_proxies = "10.0.0.0/8"
 
-    assert get_client_ip(mock_request) == "198.51.100.25"
+    with patch("app.services.rate_limiter.get_settings", return_value=mock_settings):
+        mock_request = MagicMock()
+        # Trusted internal proxy IP: 10.0.0.1
+        mock_request.client.host = "10.0.0.1"
+        # Forwarded header containing client IP 198.51.100.25
+        mock_request.headers.get.side_effect = lambda h: "198.51.100.25, 10.0.0.1" if h == "x-forwarded-for" else None
+
+        assert get_client_ip(mock_request) == "198.51.100.25"
 
 
 def test_malformed_ip_header_fallback():

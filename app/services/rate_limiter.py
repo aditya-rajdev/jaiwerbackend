@@ -39,6 +39,8 @@ def get_client_ip(request: Request) -> str:
     """Extract and validate client IP address safely using Python's ipaddress module.
 
     Ensures untrusted immediate peers cannot spoof X-Forwarded-For headers.
+    Forwarded headers are trusted ONLY if the immediate peer socket IP belongs to
+    an explicitly configured trusted proxy network in settings.trusted_proxies.
     """
     settings = get_settings()
 
@@ -46,7 +48,7 @@ def get_client_ip(request: Request) -> str:
     socket_ip_str = request.client.host if request.client else "127.0.0.1"
     socket_ip = parse_ip(socket_ip_str) or parse_ip("127.0.0.1")
 
-    # 2. Build list of trusted proxy IPs / networks
+    # 2. Build list of trusted proxy IPs / networks from explicit configuration
     trusted_proxies_list: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     if settings.trusted_proxies:
         for item in settings.trusted_proxies.split(","):
@@ -57,17 +59,12 @@ def get_client_ip(request: Request) -> str:
                 except ValueError:
                     pass
 
-    is_peer_trusted = False
-    if trusted_proxies_list:
-        is_peer_trusted = any(socket_ip in net for net in trusted_proxies_list)
-    elif settings.trusted_proxy_count > 0:
-        is_peer_trusted = socket_ip.is_loopback or socket_ip.is_private
-
-    # If immediate peer is NOT a trusted proxy, return peer socket IP directly
-    if not is_peer_trusted:
+    # Fail-safe: If no trusted proxies are configured or peer is not in list,
+    # return peer socket IP directly without reading client-supplied headers.
+    if not trusted_proxies_list or not any(socket_ip in net for net in trusted_proxies_list):
         return str(socket_ip)
 
-    # 3. Parse X-Forwarded-For header from right-to-left
+    # 3. Peer is verified as a trusted proxy. Parse X-Forwarded-For header right-to-left
     forwarded_for = request.headers.get("x-forwarded-for")
     if not forwarded_for:
         real_ip_str = request.headers.get("x-real-ip")
@@ -77,7 +74,7 @@ def get_client_ip(request: Request) -> str:
                 return str(parsed_real)
         return str(socket_ip)
 
-    # Extract rightmost non-trusted public client IP from proxy chain
+    # Extract rightmost client IP from proxy chain that is not in trusted proxy networks
     raw_ips = [ip.strip() for ip in forwarded_for.split(",")]
     parsed_ips = []
     for raw_ip in raw_ips:
@@ -89,7 +86,7 @@ def get_client_ip(request: Request) -> str:
         return str(socket_ip)
 
     for ip in reversed(parsed_ips):
-        if not (ip.is_loopback or ip.is_private):
+        if not any(ip in net for net in trusted_proxies_list):
             return str(ip)
 
     return str(parsed_ips[0])
