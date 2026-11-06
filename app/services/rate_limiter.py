@@ -1,136 +1,265 @@
+
 import ipaddress
 import logging
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any
+
 from fastapi import HTTPException, Request, status
 from postgrest.exceptions import APIError
 from supabase import Client
+
 from app.core.supabase import get_settings
+
 
 logger = logging.getLogger(__name__)
 
-# Progressive cooldown schedule in seconds
-COOLDOWN_SCHEDULE = [
-    60,   # Attempt 1 -> 60s (1 min)
-    120,  # Attempt 2 -> 120s (2 min)
-    180,  # Attempt 3 -> 180s (3 min)
-    300,  # Attempt 4 -> 300s (5 min)
-    900,  # Attempt 5 -> 900s (15 min)
-]
-MAX_SCHEDULED_COOLDOWN = 3600  # Attempt 6+ -> 3600s (1 hour)
 
-# Isolated in-memory fallback for local unit testing without PostgreSQL
+COOLDOWN_SCHEDULE = [60, 120, 180, 300, 900]
+MAX_SCHEDULED_COOLDOWN = 3600
+
+# Local/test fallback only.
+# Never use this store for production rate limiting.
 _test_memory_lock = RLock()
 _test_memory_store: dict[str, dict[str, Any]] = {}
 
 
-def parse_ip(ip_str: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-    """Safely parse an IP address string using Python's ipaddress module without throwing exceptions."""
+def parse_ip(
+    ip_str: str | None,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse a single IP address. CIDR ranges are not accepted."""
+
     if not ip_str or not isinstance(ip_str, str):
         return None
+
+    value = ip_str.strip()
+
+    if not value or "/" in value:
+        return None
+
     try:
-        return ipaddress.ip_address(ip_str.strip())
+        return ipaddress.ip_address(value)
     except ValueError:
         return None
 
 
-def get_client_ip(request: Request) -> str:
-    """Extract and validate client IP address safely using Python's ipaddress module.
+def _trusted_proxy_networks(
+    raw_value: str | None,
+) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Parse configured trusted proxy CIDRs."""
 
-    Ensures untrusted immediate peers cannot spoof X-Forwarded-For headers.
-    Forwarded headers are trusted ONLY if the immediate peer socket IP belongs to
-    an explicitly configured trusted proxy network in settings.trusted_proxies.
+    networks = []
+
+    if not raw_value:
+        return networks
+
+    for item in raw_value.split(","):
+        value = item.strip()
+
+        if not value:
+            continue
+
+        try:
+            networks.append(
+                ipaddress.ip_network(value, strict=False)
+            )
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid trusted proxy network configuration entry."
+            )
+
+    return networks
+
+
+def _is_trusted(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    networks: list[
+        ipaddress.IPv4Network | ipaddress.IPv6Network
+    ],
+) -> bool:
+    """Check whether an IP belongs to a configured trusted network."""
+
+    return any(
+        ip.version == network.version and ip in network
+        for network in networks
+    )
+
+
+def get_client_ip(request: Request) -> str:
     """
+    Extract the client IP safely.
+
+    Forwarding headers are trusted only when the immediate socket
+    peer belongs to a configured trusted proxy network.
+
+    Invalid or missing network information fails closed.
+    """
+
+    peer_text = (
+        request.client.host
+        if request.client is not None
+        else None
+    )
+
+    peer_ip = parse_ip(peer_text)
+
+    if peer_ip is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to determine client network address.",
+        )
+
     settings = get_settings()
 
-    # 1. Get raw socket connection peer IP
-    socket_ip_str = request.client.host if request.client else "127.0.0.1"
-    socket_ip = parse_ip(socket_ip_str) or parse_ip("127.0.0.1")
+    networks = _trusted_proxy_networks(
+        settings.trusted_proxies
+    )
 
-    # 2. Build list of trusted proxy IPs / networks from explicit configuration
-    trusted_proxies_list: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-    if settings.trusted_proxies:
-        for item in settings.trusted_proxies.split(","):
-            item_str = item.strip()
-            if item_str:
-                try:
-                    trusted_proxies_list.append(ipaddress.ip_network(item_str, strict=False))
-                except ValueError:
-                    pass
+    # Never trust forwarded headers from an untrusted peer.
+    if not _is_trusted(peer_ip, networks):
+        return str(peer_ip)
 
-    # Fail-safe: If no trusted proxies are configured or peer is not in list,
-    # return peer socket IP directly without reading client-supplied headers.
-    if not trusted_proxies_list or not any(socket_ip in net for net in trusted_proxies_list):
-        return str(socket_ip)
-
-    # 3. Peer is verified as a trusted proxy. Parse X-Forwarded-For header right-to-left
     forwarded_for = request.headers.get("x-forwarded-for")
-    if not forwarded_for:
-        real_ip_str = request.headers.get("x-real-ip")
-        if real_ip_str:
-            parsed_real = parse_ip(real_ip_str)
-            if parsed_real:
-                return str(parsed_real)
-        return str(socket_ip)
 
-    # Extract rightmost client IP from proxy chain that is not in trusted proxy networks
-    raw_ips = [ip.strip() for ip in forwarded_for.split(",")]
-    parsed_ips = []
-    for raw_ip in raw_ips:
-        parsed = parse_ip(raw_ip)
-        if parsed:
-            parsed_ips.append(parsed)
+    if not forwarded_for or not forwarded_for.strip():
+        return str(peer_ip)
 
-    if not parsed_ips:
-        return str(socket_ip)
+    # Preserve each hop and reject empty or malformed entries.
+    forwarded_parts = [
+        part.strip()
+        for part in forwarded_for.split(",")
+    ]
 
-    for ip in reversed(parsed_ips):
-        if not any(ip in net for net in trusted_proxies_list):
-            return str(ip)
+    forwarded_ips = [
+        parse_ip(part)
+        for part in forwarded_parts
+    ]
 
-    return str(parsed_ips[0])
+    # Correct validation: every forwarded hop must be a valid IP.
+    if (
+        not forwarded_ips
+        or any(ip is None for ip in forwarded_ips)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Invalid forwarded client address.",
+        )
+
+    # At this point, None values have already been rejected.
+    hops = forwarded_ips + [peer_ip]
+
+    # Walk from the immediate peer towards the original client.
+    index = len(hops) - 1
+
+    while index > 0 and _is_trusted(hops[index], networks):
+        index -= 1
+
+    return str(hops[index])
 
 
 def get_cooldown_duration(attempt_count: int) -> int:
-    """Calculate progressive cooldown duration based on attempt number."""
-    if attempt_count <= 0:
+    """Return progressive cooldown duration in seconds."""
+
+    if attempt_count <= 1:
         return COOLDOWN_SCHEDULE[0]
-    if attempt_count > len(COOLDOWN_SCHEDULE):
-        return MAX_SCHEDULED_COOLDOWN
-    return COOLDOWN_SCHEDULE[attempt_count - 1]
+
+    if attempt_count <= len(COOLDOWN_SCHEDULE):
+        return COOLDOWN_SCHEDULE[attempt_count - 1]
+
+    return MAX_SCHEDULED_COOLDOWN
 
 
 def format_seconds_to_mmss(total_seconds: int) -> str:
-    """Format total seconds into MM:SS format."""
-    minutes = total_seconds // 60
-    seconds = total_seconds % 60
+    """Format seconds into MM:SS."""
+
+    minutes, seconds = divmod(
+        max(0, int(total_seconds)),
+        60,
+    )
+
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def validate_rate_limit_response(
+    data: Any,
+) -> dict[str, Any]:
+    """Validate the Supabase RPC single-row response."""
+
+    unavailable = HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=(
+            "Rate limiter service is temporarily unavailable. "
+            "Please try again."
+        ),
+    )
+
+    if not isinstance(data, list) or len(data) != 1:
+        raise unavailable
+
+    result = data[0]
+
+    if not isinstance(result, dict):
+        raise unavailable
+
+    allowed = result.get("is_allowed")
+    retry_after = result.get("retry_after_seconds")
+    message = result.get("detail_message")
+
+    if not isinstance(allowed, bool):
+        raise unavailable
+
+    if (
+        not isinstance(retry_after, int)
+        or isinstance(retry_after, bool)
+        or retry_after < 0
+    ):
+        raise unavailable
+
+    if not isinstance(message, str):
+        raise unavailable
+
+    return result
 
 
 def check_and_record_otp_request(
     email: str,
     client_ip: str,
     supabase: Client | None = None,
+    *,
+    allow_test_memory_fallback: bool = False,
 ) -> tuple[bool, int, str]:
-    """Atomic progressive rate limiter for OTP requests.
-
-    Queries PostgreSQL database via check_and_record_otp_rate_limit RPC for
-    atomic row locking (FOR UPDATE) and persistent storage.
-    Fails closed if the database service is unreachable in production.
-
-    Returns:
-        (is_allowed: bool, retry_after_seconds: int, detail_message: str)
     """
-    clean_email = email.strip().lower()
-    clean_ip = client_ip.strip()
-    settings = get_settings()
-    max_daily = getattr(settings, "max_daily_otp_requests", 10)
+    Check and record an OTP request.
 
-    # 1. Primary Production Path: Supabase PostgreSQL Atomic RPC
+    Production:
+        Supabase RPC is mandatory.
+        Missing Supabase client returns HTTP 503.
+        RPC failures return HTTP 503.
+        RPC failures NEVER trigger memory fallback.
+
+    Tests:
+        In-memory fallback is allowed only when explicitly enabled
+        and no Supabase client is supplied.
+    """
+
+    clean_email = email.strip().lower()
+
+    parsed_ip = parse_ip(client_ip)
+
+    if parsed_ip is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A valid client IP address is required.",
+        )
+
+    clean_ip = str(parsed_ip)
+
+    max_daily = get_settings().max_daily_otp_requests
+
+    # Persistent Supabase rate limiting.
     if supabase is not None:
         try:
-            rpc_response = supabase.rpc(
+            response = supabase.rpc(
                 "check_and_record_otp_rate_limit",
                 {
                     "p_email": clean_email,
@@ -139,76 +268,140 @@ def check_and_record_otp_request(
                 },
             ).execute()
 
-            if rpc_response and rpc_response.data:
-                row = rpc_response.data[0] if isinstance(rpc_response.data, list) else rpc_response.data
-                is_allowed = bool(row.get("is_allowed", False))
-                retry_after = int(row.get("retry_after_seconds", 0))
-                message = str(row.get("detail_message", "OK"))
-                return is_allowed, retry_after, message
+            validated = validate_rate_limit_response(
+                response.data if response else None
+            )
+
+            return (
+                validated["is_allowed"],
+                validated["retry_after_seconds"],
+                validated["detail_message"],
+            )
+
+        except HTTPException:
+            raise
+
         except APIError as exc:
-            logger.error("Supabase PostgreSQL rate-limiter RPC failed: %s", exc.message)
-            # Fail closed: Do not allow un-rate-limited requests when database fails
+            logger.error(
+                "Supabase OTP rate-limiter RPC failed (code=%s).",
+                getattr(exc, "code", None),
+            )
+
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Rate limiter service is temporarily unavailable. Please try again.",
-            ) from None
-        except Exception:
-            logger.exception("Unexpected database failure during rate-limiting.")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Rate limiter service is temporarily unavailable. Please try again.",
+                detail=(
+                    "Rate limiter service is temporarily unavailable. "
+                    "Please try again."
+                ),
             ) from None
 
-    # 2. Local Unit-Testing Fallback (used only when supabase client dependency is not injected)
+        except Exception:
+            logger.error(
+                "Unexpected OTP rate-limiter database failure."
+            )
+
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Rate limiter service is temporarily unavailable. "
+                    "Please try again."
+                ),
+            ) from None
+
+    # Supabase client missing: production must fail closed.
+    if not allow_test_memory_fallback:
+        logger.error(
+            "OTP rate limiter unavailable: Supabase client missing."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Rate limiter service is temporarily unavailable. "
+                "Please try again."
+            ),
+        )
+
+    # Explicit local/test-only fallback.
     now = datetime.now(timezone.utc)
-    dimension_key = f"otp:{clean_email}:{clean_ip}"
+
+    key = f"otp:{clean_email}:{clean_ip}"
 
     with _test_memory_lock:
-        state = _test_memory_store.get(dimension_key)
-        if not state:
+        state = _test_memory_store.get(key)
+
+        if state is None:
             state = {
                 "attempt_count": 0,
                 "daily_count": 0,
-                "last_request_at": now,
                 "cooldown_until": now,
                 "daily_reset_at": now + timedelta(days=1),
             }
-            _test_memory_store[dimension_key] = state
 
+            _test_memory_store[key] = state
+
+        # Reset the rolling 24-hour window.
         if now >= state["daily_reset_at"]:
             state["daily_count"] = 0
             state["attempt_count"] = 0
             state["daily_reset_at"] = now + timedelta(days=1)
 
+        # Daily limit check.
         if state["daily_count"] >= max_daily:
-            retry_after = int((state["daily_reset_at"] - now).total_seconds())
-            retry_after = max(retry_after, 60)
-            return (
-                False,
-                retry_after,
-                f"Daily OTP limit reached. Please wait {format_seconds_to_mmss(retry_after)} before requesting another code.",
+            retry = max(
+                1,
+                int(
+                    (
+                        state["daily_reset_at"] - now
+                    ).total_seconds()
+                ),
             )
 
-        if now < state["cooldown_until"]:
-            retry_after = int((state["cooldown_until"] - now).total_seconds())
-            retry_after = max(retry_after, 1)
             return (
                 False,
-                retry_after,
-                f"Too many requests. Please wait {format_seconds_to_mmss(retry_after)} before retrying.",
+                retry,
+                (
+                    "Daily OTP limit reached. Please wait "
+                    f"{format_seconds_to_mmss(retry)}."
+                ),
+            )
+
+        # Progressive cooldown check.
+        if now < state["cooldown_until"]:
+            retry = max(
+                1,
+                int(
+                    (
+                        state["cooldown_until"] - now
+                    ).total_seconds()
+                ),
+            )
+
+            return (
+                False,
+                retry,
+                (
+                    "Too many requests. Please wait "
+                    f"{format_seconds_to_mmss(retry)}."
+                ),
             )
 
         state["attempt_count"] += 1
         state["daily_count"] += 1
-        state["last_request_at"] = now
 
-        cooldown_secs = get_cooldown_duration(state["attempt_count"])
-        state["cooldown_until"] = now + timedelta(seconds=cooldown_secs)
+        cooldown = get_cooldown_duration(
+            state["attempt_count"]
+        )
+
+        state["cooldown_until"] = (
+            now + timedelta(seconds=cooldown)
+        )
 
         return True, 0, "OK"
 
 
 def clear_rate_limit_store() -> None:
-    """Reset test memory store."""
+    """Clear the local/test-only in-memory rate-limit store."""
+
     with _test_memory_lock:
         _test_memory_store.clear()

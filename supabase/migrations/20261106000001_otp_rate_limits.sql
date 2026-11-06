@@ -1,142 +1,394 @@
--- ----------------------------------------------------------------------------
--- Migration: 20261106000001_otp_rate_limits.sql
--- Table, Security Policies & Atomic RPC Function for Persistent OTP Rate Limiting
--- ----------------------------------------------------------------------------
 
--- 1. Table DDL
-CREATE TABLE IF NOT EXISTS public.otp_rate_limits (
-    key TEXT PRIMARY KEY,
+BEGIN;
+
+-- =========================================================
+-- 1. OTP REQUEST EVENT TABLE
+-- One row = one OTP request admitted by the rate limiter.
+-- Events older than 24 hours are excluded from the limit.
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS public.otp_rate_limit_events (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    rate_limit_key TEXT NOT NULL,
     email TEXT NOT NULL,
     client_ip TEXT NOT NULL,
-    attempt_count INT NOT NULL DEFAULT 0,
-    daily_count INT NOT NULL DEFAULT 0,
-    last_request_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    cooldown_until TIMESTAMPTZ NOT NULL DEFAULT now(),
-    daily_reset_at TIMESTAMPTZ NOT NULL DEFAULT (now() + INTERVAL '24 hours'),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    requested_at TIMESTAMPTZ NOT NULL
+        DEFAULT pg_catalog.clock_timestamp(),
+    cooldown_seconds INTEGER NOT NULL
+        CHECK (cooldown_seconds BETWEEN 60 AND 3600)
 );
 
-CREATE INDEX IF NOT EXISTS idx_otp_rate_limits_email_ip ON public.otp_rate_limits(email, client_ip);
+CREATE INDEX IF NOT EXISTS idx_otp_rate_events_key_time
+    ON public.otp_rate_limit_events
+    (rate_limit_key, requested_at DESC);
 
--- 2. Row Level Security & Table Permissions
-ALTER TABLE public.otp_rate_limits ENABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS idx_otp_rate_events_requested_at
+    ON public.otp_rate_limit_events (requested_at);
 
-REVOKE ALL ON public.otp_rate_limits FROM PUBLIC, anon, authenticated;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.otp_rate_limits TO service_role, postgres;
+ALTER TABLE public.otp_rate_limit_events OWNER TO postgres;
 
--- 3. Atomic PostgreSQL RPC Function with Advisory Transaction Lock & Schema Qualification
+ALTER TABLE public.otp_rate_limit_events
+    ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL ON TABLE public.otp_rate_limit_events
+    FROM PUBLIC, anon, authenticated, service_role;
+
+GRANT ALL ON TABLE public.otp_rate_limit_events TO postgres;
+
+
+-- =========================================================
+-- 2. ATOMIC OTP RATE-LIMIT FUNCTION
+-- =========================================================
+
 CREATE OR REPLACE FUNCTION public.check_and_record_otp_rate_limit(
     p_email TEXT,
     p_client_ip TEXT,
-    p_max_daily INT DEFAULT 10
+    p_max_daily INTEGER DEFAULT 10
 )
 RETURNS TABLE (
     is_allowed BOOLEAN,
-    retry_after_seconds INT,
+    retry_after_seconds INTEGER,
     detail_message TEXT
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = ''
-AS $$
+AS $function$
+
 DECLARE
-    v_key pg_catalog.text;
-    v_now pg_catalog.timestamptz := pg_catalog.now();
-    v_rec public.otp_rate_limits%ROWTYPE;
-    v_cooldown_schedule pg_catalog.int4[] := ARRAY[60, 120, 180, 300, 900];
-    v_cooldown_secs pg_catalog.int4;
-    v_new_attempt pg_catalog.int4;
-    v_new_daily pg_catalog.int4;
-    v_reset_at pg_catalog.timestamptz;
+    v_email TEXT;
+    v_ip TEXT;
+    v_key TEXT;
+
+    v_now TIMESTAMPTZ;
+
+    v_request_count BIGINT;
+    v_oldest_request TIMESTAMPTZ;
+
+    v_last_request TIMESTAMPTZ;
+    v_last_cooldown INTEGER;
+    v_cooldown_until TIMESTAMPTZ;
+
+    v_next_attempt BIGINT;
+    v_new_cooldown INTEGER;
+    v_retry_after INTEGER;
+
 BEGIN
-    -- Input Validation: Length and Format Checks
-    IF p_email IS NULL OR pg_catalog.length(pg_catalog.trim(p_email)) < 3 OR pg_catalog.length(pg_catalog.trim(p_email)) > 255 OR pg_catalog.trim(p_email) NOT LIKE '%@%' THEN
-        RAISE EXCEPTION 'p_email must be a valid email address between 3 and 255 characters' USING ERRCODE = '22000';
+
+    -- -----------------------------------------------------
+    -- INPUT VALIDATION
+    -- -----------------------------------------------------
+
+    IF p_email IS NULL OR p_client_ip IS NULL THEN
+        RAISE EXCEPTION 'Invalid rate-limit input';
     END IF;
 
-    IF p_client_ip IS NULL OR pg_catalog.length(pg_catalog.trim(p_client_ip)) < 3 OR pg_catalog.length(pg_catalog.trim(p_client_ip)) > 45 THEN
-        RAISE EXCEPTION 'p_client_ip must be a valid IP address between 3 and 45 characters' USING ERRCODE = '22000';
+    v_email := pg_catalog.lower(
+        pg_catalog.btrim(p_email)
+    );
+
+    IF v_email = ''
+       OR pg_catalog.length(v_email) > 320
+       OR v_email !~ '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}$'
+    THEN
+        RAISE EXCEPTION 'Invalid rate-limit email';
     END IF;
 
-    IF p_max_daily IS NULL OR p_max_daily <= 0 THEN
-        RAISE EXCEPTION 'p_max_daily must be greater than zero' USING ERRCODE = '22000';
+    IF pg_catalog.btrim(p_client_ip) = ''
+       OR pg_catalog.length(pg_catalog.btrim(p_client_ip)) > 45
+       OR pg_catalog.strpos(pg_catalog.btrim(p_client_ip), '/') > 0
+    THEN
+        RAISE EXCEPTION 'Invalid rate-limit IP';
     END IF;
 
-    v_key := 'otp:' || pg_catalog.lower(pg_catalog.trim(p_email)) || ':' || pg_catalog.trim(p_client_ip);
+    BEGIN
 
-    -- Transactional Advisory Lock on string hash guarantees 100% atomic mutual exclusion in PostgreSQL
-    -- memory before querying or creating table rows, preventing first-request race conditions.
-    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(v_key));
-
-    -- Lock existing row if present
-    SELECT * INTO v_rec
-    FROM public.otp_rate_limits
-    WHERE key = v_key
-    FOR UPDATE;
-
-    IF NOT FOUND THEN
-        INSERT INTO public.otp_rate_limits (
-            key, email, client_ip, attempt_count, daily_count,
-            last_request_at, cooldown_until, daily_reset_at
-        ) VALUES (
-            v_key, pg_catalog.lower(pg_catalog.trim(p_email)), pg_catalog.trim(p_client_ip), 1, 1,
-            v_now, v_now + INTERVAL '60 seconds', v_now + INTERVAL '24 hours'
+        v_ip := pg_catalog.host(
+            pg_catalog.btrim(p_client_ip)::pg_catalog.inet
         );
 
-        RETURN QUERY SELECT true, 0, 'OK'::pg_catalog.text;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE EXCEPTION 'Invalid rate-limit IP';
+    END;
+
+    IF p_max_daily IS NULL
+       OR p_max_daily < 1
+       OR p_max_daily > 1000
+    THEN
+        RAISE EXCEPTION 'Invalid daily OTP limit';
+    END IF;
+
+    v_key := 'otp:' || v_email || ':' || v_ip;
+
+
+    -- -----------------------------------------------------
+    -- CONCURRENCY PROTECTION
+    -- Serialize requests for the same email + IP.
+    -- -----------------------------------------------------
+
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(v_key, 0)
+    );
+
+    -- Get actual time AFTER acquiring the lock.
+
+    v_now := pg_catalog.clock_timestamp();
+
+
+    -- -----------------------------------------------------
+    -- REMOVE EXPIRED EVENTS FOR THIS RATE-LIMIT KEY
+    -- -----------------------------------------------------
+
+    DELETE FROM public.otp_rate_limit_events AS e
+    WHERE e.rate_limit_key = v_key
+      AND e.requested_at <=
+          v_now - INTERVAL '24 hours';
+
+
+    -- -----------------------------------------------------
+    -- COUNT REQUESTS IN ROLLING 24-HOUR WINDOW
+    -- -----------------------------------------------------
+
+    SELECT
+        pg_catalog.count(*),
+        pg_catalog.min(e.requested_at)
+
+    INTO
+        v_request_count,
+        v_oldest_request
+
+    FROM public.otp_rate_limit_events AS e
+
+    WHERE e.rate_limit_key = v_key
+      AND e.requested_at > v_now - INTERVAL '24 hours';
+
+
+    -- -----------------------------------------------------
+    -- DAILY LIMIT CHECK
+    -- Maximum 10 requests in rolling 24 hours.
+    -- -----------------------------------------------------
+
+    IF v_request_count >= p_max_daily THEN
+
+        v_retry_after := GREATEST(
+            1,
+            pg_catalog.ceil(
+                EXTRACT(
+                    EPOCH FROM (
+                        v_oldest_request
+                        + INTERVAL '24 hours'
+                        - v_now
+                    )
+                )
+            )::INTEGER
+        );
+
+        RETURN QUERY
+        SELECT
+            FALSE,
+            v_retry_after,
+            'Daily OTP request limit reached. Try again later.'::TEXT;
+
         RETURN;
+
     END IF;
 
-    -- Reset daily window if 24 hours have elapsed
-    IF v_now >= v_rec.daily_reset_at THEN
-        v_new_daily := 0;
-        v_new_attempt := 0;
-        v_reset_at := v_now + INTERVAL '24 hours';
-    ELSE
-        v_new_daily := v_rec.daily_count;
-        v_new_attempt := v_rec.attempt_count;
-        v_reset_at := v_rec.daily_reset_at;
+
+    -- -----------------------------------------------------
+    -- CHECK COOLDOWN FROM MOST RECENT ACCEPTED REQUEST
+    -- -----------------------------------------------------
+
+    SELECT
+        e.requested_at,
+        e.cooldown_seconds
+
+    INTO
+        v_last_request,
+        v_last_cooldown
+
+    FROM public.otp_rate_limit_events AS e
+
+    WHERE e.rate_limit_key = v_key
+
+    ORDER BY
+        e.requested_at DESC,
+        e.id DESC
+
+    LIMIT 1;
+
+
+    IF v_last_request IS NOT NULL THEN
+
+        v_cooldown_until :=
+            v_last_request
+            + pg_catalog.make_interval(
+                secs => v_last_cooldown
+            );
+
+        IF v_now < v_cooldown_until THEN
+
+            v_retry_after := GREATEST(
+                1,
+                pg_catalog.ceil(
+                    EXTRACT(
+                        EPOCH FROM (
+                            v_cooldown_until - v_now
+                        )
+                    )
+                )::INTEGER
+            );
+
+            RETURN QUERY
+            SELECT
+                FALSE,
+                v_retry_after,
+                'OTP request cooldown active. Try again later.'::TEXT;
+
+            RETURN;
+
+        END IF;
+
     END IF;
 
-    -- 1. Enforce Daily Request Limit
-    IF v_new_daily >= p_max_daily THEN
-        v_cooldown_secs := pg_catalog.greatest(pg_catalog.extract(EPOCH FROM (v_reset_at - v_now))::pg_catalog.int4, 60);
-        RETURN QUERY SELECT false, v_cooldown_secs, ('Daily OTP limit reached. Please wait ' || v_cooldown_secs || ' seconds before requesting another code.')::pg_catalog.text;
-        RETURN;
-    END IF;
 
-    -- 2. Enforce Active Cooldown
-    IF v_now < v_rec.cooldown_until THEN
-        v_cooldown_secs := pg_catalog.greatest(pg_catalog.extract(EPOCH FROM (v_rec.cooldown_until - v_now))::pg_catalog.int4, 1);
-        RETURN QUERY SELECT false, v_cooldown_secs, ('Too many requests. Please wait ' || v_cooldown_secs || ' seconds before retrying.')::pg_catalog.text;
-        RETURN;
-    END IF;
+    -- -----------------------------------------------------
+    -- PROGRESSIVE COOLDOWN
+    --
+    -- Request 1  = 60 seconds
+    -- Request 2  = 120 seconds
+    -- Request 3  = 180 seconds
+    -- Request 4  = 300 seconds
+    -- Request 5  = 900 seconds
+    -- Request 6+ = 3600 seconds
+    --
+    -- Count is based on accepted requests still present
+    -- in the rolling 24-hour window.
+    -- -----------------------------------------------------
 
-    -- 3. Progressive Cooldown Schedule: Attempt 1=60s, 2=120s, 3=180s, 4=300s, 5=900s, 6+=3600s
-    v_new_attempt := v_new_attempt + 1;
-    v_new_daily := v_new_daily + 1;
+    v_next_attempt := v_request_count + 1;
 
-    IF v_new_attempt <= 5 THEN
-        v_cooldown_secs := v_cooldown_schedule[v_new_attempt];
-    ELSE
-        v_cooldown_secs := 3600; -- 1 hour for attempt 6+
-    END IF;
+    v_new_cooldown := CASE
 
-    UPDATE public.otp_rate_limits
-    SET attempt_count = v_new_attempt,
-        daily_count = v_new_daily,
-        last_request_at = v_now,
-        cooldown_until = v_now + (v_cooldown_secs || ' seconds')::INTERVAL,
-        daily_reset_at = v_reset_at,
-        updated_at = v_now
-    WHERE key = v_key;
+        WHEN v_next_attempt = 1 THEN 60
+        WHEN v_next_attempt = 2 THEN 120
+        WHEN v_next_attempt = 3 THEN 180
+        WHEN v_next_attempt = 4 THEN 300
+        WHEN v_next_attempt = 5 THEN 900
 
-    RETURN QUERY SELECT true, 0, 'OK'::pg_catalog.text;
+        ELSE 3600
+
+    END;
+
+
+    -- -----------------------------------------------------
+    -- RECORD THE ACCEPTED RATE-LIMIT REQUEST
+    -- -----------------------------------------------------
+
+    INSERT INTO public.otp_rate_limit_events (
+        rate_limit_key,
+        email,
+        client_ip,
+        requested_at,
+        cooldown_seconds
+    )
+
+    VALUES (
+        v_key,
+        v_email,
+        v_ip,
+        v_now,
+        v_new_cooldown
+    );
+
+
+    -- -----------------------------------------------------
+    -- REQUEST ALLOWED
+    -- -----------------------------------------------------
+
+    RETURN QUERY
+    SELECT
+        TRUE,
+        0,
+        'OTP request allowed.'::TEXT;
+
     RETURN;
-END;
-$$;
 
--- 4. RPC Function Permissions
-REVOKE EXECUTE ON FUNCTION public.check_and_record_otp_rate_limit(TEXT, TEXT, INT) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.check_and_record_otp_rate_limit(TEXT, TEXT, INT) TO service_role, postgres;
+END;
+
+$function$;
+
+
+-- =========================================================
+-- 3. FUNCTION OWNERSHIP AND PERMISSIONS
+-- =========================================================
+
+ALTER FUNCTION public.check_and_record_otp_rate_limit(
+    TEXT,
+    TEXT,
+    INTEGER
+) OWNER TO postgres;
+
+REVOKE EXECUTE ON FUNCTION public.check_and_record_otp_rate_limit(
+    TEXT,
+    TEXT,
+    INTEGER
+)
+FROM PUBLIC, anon, authenticated;
+
+GRANT EXECUTE ON FUNCTION public.check_and_record_otp_rate_limit(
+    TEXT,
+    TEXT,
+    INTEGER
+)
+TO service_role, postgres;
+
+
+-- =========================================================
+-- 4. EXPIRED EVENT CLEANUP FUNCTION
+-- This function does NOT run automatically.
+-- It must be called by a trusted scheduler if desired.
+-- =========================================================
+
+CREATE OR REPLACE FUNCTION public.purge_expired_otp_rate_limit_events()
+
+RETURNS BIGINT
+
+LANGUAGE plpgsql
+
+SECURITY DEFINER
+
+SET search_path = ''
+
+AS $cleanup$
+
+DECLARE
+    v_deleted BIGINT;
+
+BEGIN
+
+    DELETE FROM public.otp_rate_limit_events
+
+    WHERE requested_at <=
+        pg_catalog.clock_timestamp() - INTERVAL '24 hours';
+
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+
+    RETURN v_deleted;
+
+END;
+
+$cleanup$;
+
+
+ALTER FUNCTION public.purge_expired_otp_rate_limit_events()
+    OWNER TO postgres;
+
+REVOKE EXECUTE ON FUNCTION public.purge_expired_otp_rate_limit_events()
+    FROM PUBLIC, anon, authenticated;
+
+GRANT EXECUTE ON FUNCTION public.purge_expired_otp_rate_limit_events()
+    TO service_role, postgres;
+
+
+COMMIT;

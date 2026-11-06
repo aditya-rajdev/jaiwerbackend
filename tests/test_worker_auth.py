@@ -6,7 +6,7 @@ from app.core.supabase import get_supabase_client
 
 from app.services.rate_limiter import clear_rate_limit_store
 
-client = TestClient(app)
+client = TestClient(app, client=("127.0.0.1", 50000))
 
 
 @pytest.fixture(autouse=True)
@@ -18,6 +18,9 @@ def auto_clear_rate_limits():
 
 def test_worker_registration_success():
     mock_supabase = MagicMock()
+    mock_supabase.rpc.return_value.execute.return_value.data = [
+        {"is_allowed": True, "retry_after_seconds": 0, "detail_message": "OK"}
+    ]
     # Simulate pre-flight check: no existing profile for email or phone
     mock_supabase.table.return_value.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = None
     mock_supabase.auth.sign_in_with_otp.return_value = None
@@ -44,6 +47,9 @@ def test_worker_registration_success():
 
 def test_worker_duplicate_email_registration_rejected():
     mock_supabase = MagicMock()
+    mock_supabase.rpc.return_value.execute.return_value.data = [
+        {"is_allowed": True, "retry_after_seconds": 0, "detail_message": "OK"}
+    ]
     # Simulate existing profile found for email
     mock_supabase.table.return_value.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = {"user_id": "existing-uuid"}
 
@@ -65,6 +71,9 @@ def test_worker_duplicate_email_registration_rejected():
 
 def test_worker_otp_verification_success():
     mock_supabase = MagicMock()
+    mock_supabase.rpc.return_value.execute.return_value.data = [
+        {"is_allowed": True, "retry_after_seconds": 0, "detail_message": "OK"}
+    ]
     # Mock successful Supabase OTP verification
     mock_user = MagicMock()
     mock_user.id = "worker-uuid-123"
@@ -118,6 +127,9 @@ def test_worker_otp_verification_success():
 
 def test_worker_login_request_success():
     mock_supabase = MagicMock()
+    mock_supabase.rpc.return_value.execute.return_value.data = [
+        {"is_allowed": True, "retry_after_seconds": 0, "detail_message": "OK"}
+    ]
     mock_supabase.auth.sign_in_with_otp.return_value = None
 
     app.dependency_overrides[get_supabase_client] = lambda: mock_supabase
@@ -139,6 +151,9 @@ def test_worker_login_request_success():
 
 def test_resend_otp_success():
     mock_supabase = MagicMock()
+    mock_supabase.rpc.return_value.execute.return_value.data = [
+        {"is_allowed": True, "retry_after_seconds": 0, "detail_message": "OK"}
+    ]
     mock_supabase.auth.resend.return_value = None
 
     app.dependency_overrides[get_supabase_client] = lambda: mock_supabase
@@ -165,6 +180,9 @@ def test_resend_otp_rate_limit_preserves_429_and_no_fallback():
     from supabase_auth.errors import AuthApiError
 
     mock_supabase = MagicMock()
+    mock_supabase.rpc.return_value.execute.return_value.data = [
+        {"is_allowed": True, "retry_after_seconds": 0, "detail_message": "OK"}
+    ]
     err = AuthApiError("Rate limit exceeded", 429, "over_email_send_rate_limit")
     mock_supabase.auth.resend.side_effect = err
 
@@ -187,6 +205,9 @@ def test_resend_otp_server_error_returns_503():
     from supabase_auth.errors import AuthApiError
 
     mock_supabase = MagicMock()
+    mock_supabase.rpc.return_value.execute.return_value.data = [
+        {"is_allowed": True, "retry_after_seconds": 0, "detail_message": "OK"}
+    ]
     err = AuthApiError("Supabase server unavailable", 503, "unexpected_failure")
     mock_supabase.auth.resend.side_effect = err
 
@@ -207,6 +228,9 @@ def test_resend_otp_generic_response_hides_account_existence():
     from supabase_auth.errors import AuthApiError
 
     mock_supabase = MagicMock()
+    mock_supabase.rpc.return_value.execute.return_value.data = [
+        {"is_allowed": True, "retry_after_seconds": 0, "detail_message": "OK"}
+    ]
     err = AuthApiError("User not found or unconfirmed", 400, "user_not_found")
     mock_supabase.auth.resend.side_effect = err
 
