@@ -3,8 +3,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from supabase import Client, create_client
 
 class Settings(BaseSettings):
-    supabase_url : str
-    supabase_secret_key : str
+    supabase_url: str
+    supabase_secret_key: str
+    max_daily_otp_requests: int = 10
 
     model_config = SettingsConfigDict(
         env_file=".env",

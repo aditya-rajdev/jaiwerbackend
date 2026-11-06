@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from gotrue.types import User
 from postgrest.exceptions import APIError
 from supabase import Client
@@ -19,6 +19,7 @@ from app.schemas.auth import (
     RefreshSessionResponse,
 )
 from app.services.profiles import create_user_profile, get_user_profile_by_id
+from app.services.rate_limiter import check_and_record_otp_request, get_client_ip
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -54,10 +55,22 @@ def handle_auth_provider_error(exc: AuthApiError, operation: str) -> None:
     status_code=status.HTTP_202_ACCEPTED,
 )
 def register(
+    request: Request,
     payload: RegistrationRequest,
     supabase: Client = Depends(get_supabase_client),
 ):
     target_email = str(payload.email).strip().lower()
+    client_ip = get_client_ip(request)
+
+    is_allowed, retry_after, detail_msg = check_and_record_otp_request(
+        target_email, client_ip, supabase
+    )
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=detail_msg,
+            headers={"Retry-After": str(retry_after)},
+        )
 
     # 1. Fail-closed pre-flight check
     try:
@@ -185,12 +198,26 @@ def verify_otp(
     status_code=status.HTTP_200_OK,
 )
 def login(
+    request: Request,
     payload: LoginRequest,
     supabase: Client = Depends(get_supabase_client),
 ):
+    target_email = str(payload.email).strip().lower()
+    client_ip = get_client_ip(request)
+
+    is_allowed, retry_after, detail_msg = check_and_record_otp_request(
+        target_email, client_ip, supabase
+    )
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=detail_msg,
+            headers={"Retry-After": str(retry_after)},
+        )
+
     try:
         supabase.auth.sign_in_with_otp({
-            "email": str(payload.email).strip().lower(),
+            "email": target_email,
             "options": {
                 "should_create_user": False,
             },
@@ -216,10 +243,22 @@ def login(
     status_code=status.HTTP_200_OK,
 )
 def resend_otp(
+    request: Request,
     payload: ResendOTPRequest,
     supabase: Client = Depends(get_supabase_client),
 ):
     target_email = str(payload.email).strip().lower()
+    client_ip = get_client_ip(request)
+
+    is_allowed, retry_after, detail_msg = check_and_record_otp_request(
+        target_email, client_ip, supabase
+    )
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=detail_msg,
+            headers={"Retry-After": str(retry_after)},
+        )
 
     try:
         supabase.auth.resend({

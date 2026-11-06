@@ -4,7 +4,16 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.core.supabase import get_supabase_client
 
+from app.services.rate_limiter import clear_rate_limit_store
+
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def auto_clear_rate_limits():
+    clear_rate_limit_store()
+    yield
+    clear_rate_limit_store()
 
 
 def test_worker_registration_success():
