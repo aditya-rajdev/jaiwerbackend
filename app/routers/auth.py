@@ -11,13 +11,14 @@ from app.schemas.auth import (
     LoginRequest,
     MessageResponse,
     RegistrationRequest,
+    ResendOTPRequest,
     UserMeResponse,
     VerifyOTPRequest,
     VerifyOTPResponse,
     RefreshSessionRequest,
     RefreshSessionResponse,
 )
-from app.services.profiles import create_user_profile
+from app.services.profiles import create_user_profile, get_user_profile_by_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -60,25 +61,37 @@ def register(
 
     # 1. Fail-closed pre-flight check
     try:
-        existing = (
+        existing_email = (
             supabase.table("user_profiles")
             .select("user_id")
             .eq("email", target_email)
             .maybe_single()
             .execute()
         )
+        if existing_email and existing_email.data:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this email address already exists. Please log in.",
+            )
+
+        existing_phone = (
+            supabase.table("user_profiles")
+            .select("user_id")
+            .eq("phone_number", payload.phone_number)
+            .maybe_single()
+            .execute()
+        )
+        if existing_phone and existing_phone.data:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this mobile number already exists. Please log in.",
+            )
     except APIError:
         logger.exception("Database check failed during registration.")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Registration is temporarily unavailable. Please try again.",
         ) from None
-
-    if existing and existing.data:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An account with this email already exists. Please log in.",
-        )
 
     # 2. Dispatch sign-up OTP
     try:
@@ -197,16 +210,61 @@ def login(
     )
 
 
+@router.post(
+    "/resend-otp",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+)
+def resend_otp(
+    payload: ResendOTPRequest,
+    supabase: Client = Depends(get_supabase_client),
+):
+    target_email = str(payload.email).strip().lower()
+
+    try:
+        supabase.auth.resend({
+            "type": "signup",
+            "email": target_email,
+        })
+    except AuthApiError as exc:
+        handle_auth_provider_error(exc, "resend OTP")
+        # For non-429 / non-5xx provider rejections, fall through to generic response below
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected failure during resend OTP.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Resend OTP is temporarily unavailable. Please try again.",
+        ) from None
+
+    return MessageResponse(
+        message="If an account exists for this address, a new verification code has been sent."
+    )
+
+
 @router.get(
     "/me",
     response_model=UserMeResponse,
     status_code=status.HTTP_200_OK,
 )
-def get_me(user: User = Depends(get_current_user)):
+def get_me(
+    user: User = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase_client),
+):
+    profile = get_user_profile_by_id(str(user.id), supabase)
+    account_type = profile.get("account_type") if profile else None
+    name = profile.get("name") if profile else None
+    phone_number = profile.get("phone_number") if profile else None
+
     return UserMeResponse(
         user_id=str(user.id),
         email=user.email,
         email_verified=getattr(user, "email_confirmed_at", None) is not None,
+        account_type=account_type,
+        name=name,
+        phone_number=phone_number,
+        profile=profile,
     )
 
 @router.post(

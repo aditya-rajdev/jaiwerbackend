@@ -32,6 +32,12 @@ class LoginRequest(BaseModel):
     email: EmailStr
 
 
+class ResendOTPRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    email: EmailStr
+
+
 class VerifyOTPRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -79,6 +85,10 @@ class UserMeResponse(BaseModel):
     user_id: str
     email: EmailStr
     email_verified: bool
+    account_type: str | None = None
+    name: str | None = None
+    phone_number: str | None = None
+    profile: ProfileResponse | None = None
 
 class RefreshSessionRequest(BaseModel):
     refresh_token: str = Field(min_length=1)
