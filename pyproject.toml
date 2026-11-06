@@ -1,0 +1,17 @@
+[project]
+name = "jaiwer-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "email-validator>=2.3.0",
+    "fastapi[standard]>=0.159.1",
+    "fpdf2>=2.9.0",
+    "gotrue>=2.12.4",
+    "httpx>=0.28.1",
+    "pydantic-settings>=2.16.1",
+    "supabase>=2.33.0",
+    "tzdata>=2026.6",
+    "uharfbuzz>=0.57.0",
+]
