@@ -1,8 +1,14 @@
+import os
 import json
 import uuid
 import concurrent.futures
 import psycopg2
 import pytest
+
+pytestmark = pytest.mark.skipif(
+    not os.getenv("RUN_LIVE_POSTGRESQL_TESTS"),
+    reason="Live local PostgreSQL database instance not running in environment"
+)
 
 PG_CONN_STR = "postgresql://postgres@127.0.0.1:5439/jaiwer_v464_fresh_test"
 

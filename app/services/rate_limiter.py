@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 from datetime import datetime, timedelta, timezone
 from threading import RLock
@@ -24,29 +25,74 @@ _test_memory_lock = RLock()
 _test_memory_store: dict[str, dict[str, Any]] = {}
 
 
+def parse_ip(ip_str: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Safely parse an IP address string using Python's ipaddress module without throwing exceptions."""
+    if not ip_str or not isinstance(ip_str, str):
+        return None
+    try:
+        return ipaddress.ip_address(ip_str.strip())
+    except ValueError:
+        return None
+
+
 def get_client_ip(request: Request) -> str:
-    """Extract client IP address safely without trusting forged proxy headers."""
+    """Extract and validate client IP address safely using Python's ipaddress module.
+
+    Ensures untrusted immediate peers cannot spoof X-Forwarded-For headers.
+    """
+    settings = get_settings()
+
+    # 1. Get raw socket connection peer IP
+    socket_ip_str = request.client.host if request.client else "127.0.0.1"
+    socket_ip = parse_ip(socket_ip_str) or parse_ip("127.0.0.1")
+
+    # 2. Build list of trusted proxy IPs / networks
+    trusted_proxies_list: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    if settings.trusted_proxies:
+        for item in settings.trusted_proxies.split(","):
+            item_str = item.strip()
+            if item_str:
+                try:
+                    trusted_proxies_list.append(ipaddress.ip_network(item_str, strict=False))
+                except ValueError:
+                    pass
+
+    is_peer_trusted = False
+    if trusted_proxies_list:
+        is_peer_trusted = any(socket_ip in net for net in trusted_proxies_list)
+    elif settings.trusted_proxy_count > 0:
+        is_peer_trusted = socket_ip.is_loopback or socket_ip.is_private
+
+    # If immediate peer is NOT a trusted proxy, return peer socket IP directly
+    if not is_peer_trusted:
+        return str(socket_ip)
+
+    # 3. Parse X-Forwarded-For header from right-to-left
     forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        ips = [ip.strip() for ip in forwarded_for.split(",")]
-        for ip in ips:
-            if ip and not (
-                ip.startswith("127.")
-                or ip.startswith("10.")
-                or ip.startswith("172.16.")
-                or ip.startswith("192.168.")
-            ):
-                return ip
-        return ips[0]
+    if not forwarded_for:
+        real_ip_str = request.headers.get("x-real-ip")
+        if real_ip_str:
+            parsed_real = parse_ip(real_ip_str)
+            if parsed_real:
+                return str(parsed_real)
+        return str(socket_ip)
 
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
+    # Extract rightmost non-trusted public client IP from proxy chain
+    raw_ips = [ip.strip() for ip in forwarded_for.split(",")]
+    parsed_ips = []
+    for raw_ip in raw_ips:
+        parsed = parse_ip(raw_ip)
+        if parsed:
+            parsed_ips.append(parsed)
 
-    if request.client and request.client.host:
-        return request.client.host
+    if not parsed_ips:
+        return str(socket_ip)
 
-    return "127.0.0.1"
+    for ip in reversed(parsed_ips):
+        if not (ip.is_loopback or ip.is_private):
+            return str(ip)
+
+    return str(parsed_ips[0])
 
 
 def get_cooldown_duration(attempt_count: int) -> int:

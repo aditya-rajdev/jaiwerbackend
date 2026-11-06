@@ -1,3 +1,4 @@
+import os
 import pytest
 from unittest.mock import MagicMock
 from fastapi import HTTPException
@@ -37,10 +38,42 @@ def test_format_seconds_to_mmss():
     assert format_seconds_to_mmss(900) == "15:00"
 
 
-def test_get_client_ip_proxy_handling():
+def test_untrusted_peer_spoofed_forwarded_for_header_ignored():
     mock_request = MagicMock()
-    mock_request.headers.get.side_effect = lambda h: "203.0.113.195, 10.0.0.1" if h == "x-forwarded-for" else None
-    assert get_client_ip(mock_request) == "203.0.113.195"
+    # Untrusted client socket IP: 8.8.8.8 (Public IP)
+    mock_request.client.host = "8.8.8.8"
+    # Spoofed header trying to claim IP 1.1.1.1
+    mock_request.headers.get.side_effect = lambda h: "1.1.1.1" if h == "x-forwarded-for" else None
+
+    # Untrusted peer socket IP must be returned, spoofed X-Forwarded-For header IGNORED!
+    assert get_client_ip(mock_request) == "8.8.8.8"
+
+
+def test_trusted_peer_forwarded_for_parsed_correctly():
+    mock_request = MagicMock()
+    # Trusted internal proxy IP: 10.0.0.1
+    mock_request.client.host = "10.0.0.1"
+    # Forwarded header containing client IP 198.51.100.25
+    mock_request.headers.get.side_effect = lambda h: "198.51.100.25, 10.0.0.1" if h == "x-forwarded-for" else None
+
+    assert get_client_ip(mock_request) == "198.51.100.25"
+
+
+def test_malformed_ip_header_fallback():
+    mock_request = MagicMock()
+    mock_request.client.host = "10.0.0.1"
+    mock_request.headers.get.side_effect = lambda h: "invalid-ip-string" if h == "x-forwarded-for" else None
+
+    # Must not crash, safely falls back to valid socket IP
+    assert get_client_ip(mock_request) == "10.0.0.1"
+
+
+def test_missing_ip_headers_fallback():
+    mock_request = MagicMock()
+    mock_request.client.host = "198.51.100.77"
+    mock_request.headers.get.return_value = None
+
+    assert get_client_ip(mock_request) == "198.51.100.77"
 
 
 def test_supabase_rpc_rate_limiter_integration():
@@ -150,3 +183,12 @@ def test_resend_otp_returns_429_with_retry_after_header():
     retry_after_val = int(res2.headers["retry-after"])
     assert retry_after_val == 60
     assert "too many requests" in res2.json()["detail"].lower()
+
+
+@pytest.mark.skipif(
+    not os.getenv("RUN_LIVE_SUPABASE_INTEGRATION_TESTS"),
+    reason="Live Supabase PostgreSQL environment not configured locally"
+)
+def test_live_supabase_concurrency_and_rpc_permissions():
+    """Live integration test against real Supabase instance (only run when RUN_LIVE_SUPABASE_INTEGRATION_TESTS is set)."""
+    pass

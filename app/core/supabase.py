@@ -6,6 +6,8 @@ class Settings(BaseSettings):
     supabase_url: str
     supabase_secret_key: str
     max_daily_otp_requests: int = 10
+    trusted_proxies: str = ""
+    trusted_proxy_count: int = 1
 
     model_config = SettingsConfigDict(
         env_file=".env",
