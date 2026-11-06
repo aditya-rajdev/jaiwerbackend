@@ -25,7 +25,7 @@ ALTER TABLE public.otp_rate_limits ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON public.otp_rate_limits FROM PUBLIC, anon, authenticated;
 GRANT ALL ON public.otp_rate_limits TO service_role, postgres;
 
--- 3. Atomic PostgreSQL RPC Function with Advisory Transaction Lock
+-- 3. Atomic PostgreSQL RPC Function with Advisory Transaction Lock & Input Validation
 CREATE OR REPLACE FUNCTION public.check_and_record_otp_rate_limit(
     p_email TEXT,
     p_client_ip TEXT,
@@ -50,6 +50,19 @@ DECLARE
     v_new_daily INT;
     v_reset_at TIMESTAMPTZ;
 BEGIN
+    -- Input Validation
+    IF p_email IS NULL OR trim(p_email) = '' THEN
+        RAISE EXCEPTION 'p_email cannot be empty' USING ERRCODE = '22000';
+    END IF;
+
+    IF p_client_ip IS NULL OR trim(p_client_ip) = '' THEN
+        RAISE EXCEPTION 'p_client_ip cannot be empty' USING ERRCODE = '22000';
+    END IF;
+
+    IF p_max_daily IS NULL OR p_max_daily <= 0 THEN
+        RAISE EXCEPTION 'p_max_daily must be greater than zero' USING ERRCODE = '22000';
+    END IF;
+
     v_key := 'otp:' || lower(trim(p_email)) || ':' || trim(p_client_ip);
 
     -- Transactional Advisory Lock on string hash guarantees 100% atomic mutual exclusion
